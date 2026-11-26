@@ -661,11 +661,8 @@ unsafe fn merge_insert(
             // a success & rowid of -1 means the merge was a no-op
             if inner_rowid != -1 {
                 (*(*tab).pExtData).rowsImpacted += 1;
-                *rowid = encode_op_rowid(
-                    ChangeOp::Resurrection,
-                    tbl_info_index as i32,
-                    inner_rowid,
-                );
+                *rowid =
+                    encode_op_rowid(ChangeOp::Resurrection, tbl_info_index as i32, inner_rowid);
             }
         }
 

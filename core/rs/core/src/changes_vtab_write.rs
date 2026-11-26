@@ -18,6 +18,25 @@ use crate::stmt_cache::reset_cached_stmt;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
 use crate::util::slab_rowid;
 
+#[repr(i64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeOp {
+    Noop = 0,
+    Insert = 1,
+    Update = 2,
+    Delete = 3,
+    Resurrection = 4,
+}
+
+#[inline]
+fn encode_op_rowid(op: ChangeOp, tbl_idx: i32, inner_rowid: sqlite::int64) -> sqlite::int64 {
+    let base = slab_rowid(tbl_idx, inner_rowid);
+    if base < 0 {
+        return base;
+    }
+    ((op as i64) << 60) | base
+}
+
 /**
  * did_cid_win does not take into account the causal length.
  * The expectation is that all causal length concerns have already been handle
@@ -571,7 +590,7 @@ unsafe fn merge_insert(
                 }
                 Ok(inner_rowid) => {
                     (*(*tab).pExtData).rowsImpacted += 1;
-                    *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                    *rowid = encode_op_rowid(ChangeOp::Delete, tbl_info_index as i32, inner_rowid);
                     return Ok(ResultCode::OK);
                 }
             }
@@ -606,7 +625,12 @@ unsafe fn merge_insert(
             // a success & rowid of -1 means the merge was a no-op
             if inner_rowid != -1 {
                 (*(*tab).pExtData).rowsImpacted += 1;
-                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                let op = if row_exists_locally || insert_cl > 1 {
+                    ChangeOp::Resurrection
+                } else {
+                    ChangeOp::Insert
+                };
+                *rowid = encode_op_rowid(op, tbl_info_index as i32, inner_rowid);
             }
             return Ok(ResultCode::OK);
         }
@@ -617,7 +641,9 @@ unsafe fn merge_insert(
         // which should resurrect the row. I.e., don't wait on the sentinel value to resurrect the row!
         // If the row does not exist locally and the insert_cl is > 1 then we need to create a sentinel to record the insert cl.
         // Not doing so will cause us to assume a cl of 1.
-        if needs_resurrect && (row_exists_locally || (!row_exists_locally && insert_cl > 1)) {
+        let is_resurrection =
+            needs_resurrect && (row_exists_locally || (!row_exists_locally && insert_cl > 1));
+        if is_resurrection {
             // this should work -- same as `merge_sentinel_only_insert` except we're not done once we do it
             // and the version to set to is the cl not col_vrsn of current insert
             let inner_rowid = merge_sentinel_only_insert(
@@ -635,7 +661,11 @@ unsafe fn merge_insert(
             // a success & rowid of -1 means the merge was a no-op
             if inner_rowid != -1 {
                 (*(*tab).pExtData).rowsImpacted += 1;
-                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                *rowid = encode_op_rowid(
+                    ChangeOp::Resurrection,
+                    tbl_info_index as i32,
+                    inner_rowid,
+                );
             }
         }
 
@@ -710,7 +740,14 @@ unsafe fn merge_insert(
             }
             Ok(inner_rowid) => {
                 (*(*tab).pExtData).rowsImpacted += 1;
-                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                let op = if is_resurrection {
+                    ChangeOp::Resurrection
+                } else if !row_exists_locally {
+                    ChangeOp::Insert
+                } else {
+                    ChangeOp::Update
+                };
+                *rowid = encode_op_rowid(op, tbl_info_index as i32, inner_rowid);
                 return Ok(ResultCode::OK);
             }
         }
